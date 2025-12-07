@@ -2,6 +2,14 @@ from flask import Flask, request, jsonify
 
 import os
 from supabase import create_client, Client
+import tempfile
+import asyncio
+
+#added this for running upload work in background
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+
+from uploader import process_file
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -12,6 +20,11 @@ import asyncio
 from uploader import process_file
 
 app = Flask(__name__)
+
+#thread pool where background work runns... have 4 workers
+executor = ThreadPoolExecutor(max_workers=4)
+#temp for keeping track of tasks
+upload_tasks = {}
 
 @app.route('/')
 def index():
@@ -109,6 +122,25 @@ def get_species_changes():
         "per_page": per_page,
         "data": result.data #just this pages rows
     })
+
+"""
+function runs in seperate background thread so API doesn't stall
+when processing larger files
+"""
+def run_upload_task(task_id, temp_path):
+    try:
+        asyncio.run(process_file(temp_path, translate=False))  # English
+        asyncio.run(process_file(temp_path, translate=True))   # Tetum
+
+        #marking taskscomplete
+        upload_tasks[task_id]["status"] =  "completed"
+        upload_tasks[task_id]["error"] = None
+    except Exception as e:
+        #if errors out, record
+        upload_tasks[task_id]["status"] = "failed"
+        upload_tasks[task_id]["error"] = str(e)
+        
+
 """
 This endpoint accepts an Excel or CSV file upload 
 and processes it to populate the species_en and species_tet tables in the database.
@@ -131,8 +163,16 @@ def upload_species_file():
             uploaded_file.save(tmp.name)
             temp_path = tmp.name
 
-        asyncio.run(process_file(temp_path, translate=False))  # English
-        asyncio.run(process_file(temp_path, translate=True))   # Tetum
+        # creating taskid and marking as pending
+        task_id = str(uuid.uuid4())
+        upload_tasks[task_id] = {
+            "status": "pending",
+            "error": None
+        }
+
+        #now we can hand the workover toworker thread...
+        #faster main appi thread return
+        executor.submit(run_upload_task, task_id,temp_path)
 
         return jsonify({
             "status": "success",
@@ -141,6 +181,21 @@ def upload_species_file():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+#endpoitn for checking status of upload task. 
+#can be used in future for showing any progress or errors in the admin panel
+@app.get("/upload-tasks/<task_id>")
+def get_upload_task_status(task_id):
+    task =upload_tasks.get(task_id)
+
+    if task is None:
+        return jsonify({"error": "Task id not found"}), 404
+
+    return jsonify({
+        "task_id": task_id,
+        "status": task["status"],
+        "error": task["error"]
+    }), 200
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
